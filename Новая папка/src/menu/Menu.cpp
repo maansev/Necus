@@ -1,4 +1,4 @@
-﻿// =============================================================================
+// =============================================================================
 //  Menu.cpp  —  Necus  |  Dear ImGui implementation
 //
 //  Re-skinned to match the "gamesense v2" visual language:
@@ -237,9 +237,11 @@ namespace UI {
         }
         ImGui::Dummy(ImVec2(g_card.w, kHeaderH + 6.f));
         ImGui::Indent(kPadX);
+        ImGui::PushID(title);            // scope all widget IDs to this card (no label clashes)
     }
 
     static void EndCard() {
+        ImGui::PopID();
         ImGui::Unindent(kPadX);
         ImGui::Dummy(ImVec2(0, 9.f));
         ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -284,7 +286,7 @@ namespace UI {
     static bool Checkbox(const char* label, bool* v, int* kb = nullptr, bool locked = false) {
         if (!MatchSearch(label)) return false;
         ImGui::PushID(label);
-        float w0 = ImGui::GetContentRegionAvail().x;
+        float w0 = ImGui::GetContentRegionAvail().x - kPadX;   // leave right padding (symmetric with left)
         ImVec2 p = ImGui::GetCursorScreenPos();
         float rowH = 22.f, box = 16.f, cy = p.y + rowH * 0.5f;
         // full-row hit (label area) toggles
@@ -322,7 +324,7 @@ namespace UI {
         if (!MatchSearch(label)) return false;
         ImGui::PushID(label);
         float startX = ImGui::GetCursorPosX();
-        float w0 = ImGui::GetContentRegionAvail().x;
+        float w0 = ImGui::GetContentRegionAvail().x - kPadX;   // leave right padding (symmetric with left)
         // label + right-aligned value on the same line
         ImGui::PushStyleColor(ImGuiCol_Text, Col::TextMid);
         ImGui::TextUnformatted(label);
@@ -360,31 +362,43 @@ namespace UI {
         return a;
     }
 
-    // styled single-select combo
+    // styled single-select combo (label left, box right — inline like the reference)
     static bool Combo(const char* label, int* cur, const char* const items[], int count) {
         if (!MatchSearch(label)) return false;
         ImGui::PushID(label);
+        float startX = ImGui::GetCursorPosX();
+        float w0 = ImGui::GetContentRegionAvail().x - kPadX;
+        float boxW = ImClamp(w0 * 0.52f, 96.f, 168.f);
         ImGui::PushStyleColor(ImGuiCol_Text, Col::TextMid);
+        ImGui::AlignTextToFramePadding();
         ImGui::TextUnformatted(label);
         ImGui::PopStyleColor();
-        ImGui::SetNextItemWidth(-FLT_MIN);
+        ImGui::SameLine();
+        ImGui::SetCursorPosX(startX + w0 - boxW);
+        ImGui::SetNextItemWidth(boxW);
         bool changed = ImGui::Combo("##c", cur, items, count);
         ImGui::PopID();
         return changed;
     }
 
-    // multi-select combo (checkbox list inside popup)
+    // multi-select combo (label left, box right — inline)
     static void MultiCombo(const char* label, const char* const items[], bool* flags, int count) {
         if (!MatchSearch(label)) return;
         ImGui::PushID(label);
-        ImGui::PushStyleColor(ImGuiCol_Text, Col::TextMid);
-        ImGui::TextUnformatted(label);
-        ImGui::PopStyleColor();
         std::string summary; int n = 0;
         for (int i = 0; i < count; ++i) if (flags[i]) { if (n) summary += ", "; summary += items[i]; ++n; }
         if (n == 0) summary = "None";
         else if (n > 2) { char b[32]; snprintf(b, sizeof(b), "%d selected", n); summary = b; }
-        ImGui::SetNextItemWidth(-FLT_MIN);
+        float startX = ImGui::GetCursorPosX();
+        float w0 = ImGui::GetContentRegionAvail().x - kPadX;
+        float boxW = ImClamp(w0 * 0.52f, 96.f, 168.f);
+        ImGui::PushStyleColor(ImGuiCol_Text, Col::TextMid);
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(label);
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+        ImGui::SetCursorPosX(startX + w0 - boxW);
+        ImGui::SetNextItemWidth(boxW);
         if (ImGui::BeginCombo("##mc", summary.c_str())) {
             for (int i = 0; i < count; ++i) ImGui::Checkbox(items[i], &flags[i]);
             ImGui::EndCombo();
@@ -400,7 +414,7 @@ namespace UI {
         ImGui::PopStyleColor();
         ImGui::SameLine();
         float avail = ImGui::GetContentRegionAvail().x;
-        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + avail - 22.f);
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + avail - 22.f - kPadX);
         ImGui::ColorEdit4("##col", rgba, ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel);
         ImGui::PopID();
     }
@@ -438,18 +452,26 @@ static void DrawTabIcon(ImDrawList* dl, ImVec2 c, int tab, ImU32 col) {
         dl->AddLine(ImVec2(c.x - s + 2, c.y + s - 2), ImVec2(c.x + s - 2, c.y + s - 2), col, th);
         break;
     }
-    case 2: // Visuals — eye (version-safe: ring + pupil)
-        dl->AddCircle(c, s, col, 28, th);
+    case 2: { // Visuals — eye (almond outline + pupil)
+        ImVec2 L(c.x - s, c.y), R(c.x + s, c.y);
+        dl->AddBezierQuadratic(L, ImVec2(c.x, c.y - s * 0.85f), R, col, th, 0);
+        dl->AddBezierQuadratic(L, ImVec2(c.x, c.y + s * 0.85f), R, col, th, 0);
         dl->AddCircleFilled(c, 3.0f, col);
         break;
+    }
     case 3: // Skins — pen
         dl->AddLine(ImVec2(c.x - s + 2, c.y + s - 2), ImVec2(c.x + s - 4, c.y - s + 4), col, th + 0.6f);
         dl->AddTriangleFilled(ImVec2(c.x - s + 2, c.y + s - 2), ImVec2(c.x - s + 6, c.y + s - 2), ImVec2(c.x - s + 2, c.y + s - 6), col);
         break;
-    case 4: { // Misc — gear
-        dl->AddCircle(c, s - 3, col, 24, th);
-        for (int i = 0; i < 8; ++i) { float a = i * 0.785398f; dl->AddLine(ImVec2(c.x + cosf(a) * (s - 3), c.y + sinf(a) * (s - 3)), ImVec2(c.x + cosf(a) * s, c.y + sinf(a) * s), col, th); }
-        dl->AddCircleFilled(c, 2.f, col);
+    case 4: { // Misc — people
+        // main person (left)
+        dl->AddCircle(ImVec2(c.x - 3, c.y - 4), 3.4f, col, 16, th);
+        dl->PathArcTo(ImVec2(c.x - 3, c.y + 7), 6.5f, IM_PI * 1.12f, IM_PI * 1.88f, 20);
+        dl->PathStroke(col, 0, th);
+        // smaller person (right, behind)
+        dl->AddCircle(ImVec2(c.x + 5, c.y - 1), 2.6f, col, 14, th);
+        dl->PathArcTo(ImVec2(c.x + 5, c.y + 8), 5.0f, IM_PI * 1.15f, IM_PI * 1.85f, 18);
+        dl->PathStroke(col, 0, th);
         break;
     }
     case 5: // Config — sliders
@@ -477,7 +499,7 @@ static void RenderRageTab() {
 
     // ── Column A: Aimbot (per-weapon) ────────────────────────────────────────
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
-    ImGui::BeginChild("rageA", ImVec2(colW, 0), false);
+    ImGui::BeginChild("rageA", ImVec2(colW, 0), false, ImGuiWindowFlags_NoScrollbar);
     UI::ColTitle("Aimbot");
 
     UI::BeginCard("General", badge);
@@ -509,7 +531,7 @@ static void RenderRageTab() {
     ImGui::SameLine(0, gap);
 
     // ── Column B: Anti-Aim (global) ──────────────────────────────────────────
-    ImGui::BeginChild("rageB", ImVec2(0, 0), false);
+    ImGui::BeginChild("rageB", ImVec2(0, 0), false, ImGuiWindowFlags_NoScrollbar);
     UI::ColTitle("Anti-Aim");
 
     UI::BeginCard("Exploits");
@@ -591,7 +613,7 @@ static void RenderLegitTab() {
     float gap = 14.f, colW = (ImGui::GetContentRegionAvail().x - gap) / 2.f;
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
 
-    ImGui::BeginChild("legitA", ImVec2(colW, 0), false);
+    ImGui::BeginChild("legitA", ImVec2(colW, 0), false, ImGuiWindowFlags_NoScrollbar);
     UI::ColTitle("Aimbot");
     UI::BeginCard("Aimbot", badge);
     {
@@ -610,7 +632,7 @@ static void RenderLegitTab() {
 
     ImGui::SameLine(0, gap);
 
-    ImGui::BeginChild("legitB", ImVec2(0, 0), false);
+    ImGui::BeginChild("legitB", ImVec2(0, 0), false, ImGuiWindowFlags_NoScrollbar);
     UI::ColTitle("Combat");
     UI::BeginCard("RCS & Triggerbot");
     {
@@ -665,7 +687,7 @@ static void RenderVisualsTab() {
 
     if (g_visualsSub == 0 || g_visualsSub == 1) {
         bool e = (g_visualsSub == 0);
-        ImGui::BeginChild("visA", ImVec2(colW, 0), false);
+        ImGui::BeginChild("visA", ImVec2(colW, 0), false, ImGuiWindowFlags_NoScrollbar);
         UI::ColTitle(e ? "Enemies" : "Teammates");
         UI::BeginCard(e ? "Enemy ESP" : "Teammate ESP");
         {
@@ -714,7 +736,7 @@ static void RenderVisualsTab() {
 
         ImGui::SameLine(0, gap);
 
-        ImGui::BeginChild("visB", ImVec2(0, 0), false);
+        ImGui::BeginChild("visB", ImVec2(0, 0), false, ImGuiWindowFlags_NoScrollbar);
         UI::ColTitle("Materials");
         UI::BeginCard("Chams");
         {
@@ -746,7 +768,7 @@ static void RenderVisualsTab() {
         ImGui::EndChild();
     }
     else { // World
-        ImGui::BeginChild("worldA", ImVec2(colW, 0), false);
+        ImGui::BeginChild("worldA", ImVec2(colW, 0), false, ImGuiWindowFlags_NoScrollbar);
         UI::ColTitle("World");
         UI::BeginCard("World ESP");
         {
@@ -757,7 +779,7 @@ static void RenderVisualsTab() {
 
         ImGui::SameLine(0, gap);
 
-        ImGui::BeginChild("worldB", ImVec2(0, 0), false);
+        ImGui::BeginChild("worldB", ImVec2(0, 0), false, ImGuiWindowFlags_NoScrollbar);
         UI::ColTitle("Environment");
         UI::BeginCard("Night Mode");
         {
@@ -778,7 +800,7 @@ static void RenderSkinsTab() {
     float gap = 14.f, colW = (ImGui::GetContentRegionAvail().x - gap) / 2.f;
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
 
-    ImGui::BeginChild("skinA", ImVec2(colW, 0), false);
+    ImGui::BeginChild("skinA", ImVec2(colW, 0), false, ImGuiWindowFlags_NoScrollbar);
     UI::ColTitle("Weapons");
     UI::BeginCard("Knife");
     {
@@ -802,7 +824,7 @@ static void RenderSkinsTab() {
 
     ImGui::SameLine(0, gap);
 
-    ImGui::BeginChild("skinB", ImVec2(0, 0), false);
+    ImGui::BeginChild("skinB", ImVec2(0, 0), false, ImGuiWindowFlags_NoScrollbar);
     UI::ColTitle("Settings");
     UI::BeginCard("Apply");
     {
@@ -813,7 +835,7 @@ static void RenderSkinsTab() {
         UI::SliderI("Wear", &g_skins.wear, 0, 100, "%.0f%%");
         UI::SliderI("Pattern seed", &g_skins.seed, 0, 1000, "%.0f");
         ImGui::Dummy(ImVec2(0, 2));
-        if (UI::StyledButton("Apply skin changes", ImVec2(-FLT_MIN, 30), true)) { /* hook backend */ }
+        if (UI::StyledButton("Apply skin changes", ImVec2(-UI::kPadX, 30), true)) { /* hook backend */ }
     }
     UI::EndCard();
     ImGui::EndChild();
@@ -824,7 +846,8 @@ static void RenderMiscTab() {
     float gap = 14.f, colW = (ImGui::GetContentRegionAvail().x - gap) / 2.f;
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
 
-    ImGui::BeginChild("miscA", ImVec2(colW, 0), false);
+    // ── Left column: Movement, then Settings underneath ──────────────────────
+    ImGui::BeginChild("miscA", ImVec2(colW, 0), false, ImGuiWindowFlags_NoScrollbar);
     UI::ColTitle("Movement");
     UI::BeginCard("Movement");
     {
@@ -833,11 +856,7 @@ static void RenderMiscTab() {
         UI::Checkbox("Infinite Duck", &Globals::misc_infinite_duck);
     }
     UI::EndCard();
-    ImGui::EndChild();
 
-    ImGui::SameLine(0, gap);
-
-    ImGui::BeginChild("miscB", ImVec2(0, 0), false);
     UI::ColTitle("Settings");
     UI::BeginCard("Visuals & Helpers");
     {
@@ -858,17 +877,21 @@ static void RenderMiscTab() {
         UI::Checkbox("Watermark", &Globals::misc_watermark);
     }
     UI::EndCard();
+    ImGui::EndChild();
 
-    // Config save/load lives here — the gamesense v2 reference keeps it inside Misc,
-    // not as a separate sidebar tab.
+    ImGui::SameLine(0, gap);
+
+    // ── Right column: Configuration ──────────────────────────────────────────
+    ImGui::BeginChild("miscB", ImVec2(0, 0), false, ImGuiWindowFlags_NoScrollbar);
+    UI::ColTitle("Configuration");
     UI::BeginCard("Configuration");
     {
         ImGui::PushStyleColor(ImGuiCol_FrameBg, Col::Frame);
-        ImGui::SetNextItemWidth(-FLT_MIN);
+        ImGui::SetNextItemWidth(-UI::kPadX);
         ImGui::InputTextWithHint("##cfgname", "Config name", g_cfgName, IM_ARRAYSIZE(g_cfgName));
         ImGui::PopStyleColor();
         ImGui::Dummy(ImVec2(0, 4));
-        float bw = (ImGui::GetContentRegionAvail().x - 14) / 3.f;
+        float bw = (ImGui::GetContentRegionAvail().x - UI::kPadX - 14) / 3.f;
         if (UI::StyledButton("Save", ImVec2(bw, 30), true)) Config::Save(g_cfgName);
         ImGui::SameLine(0, 7);
         if (UI::StyledButton("Load", ImVec2(bw, 30)))       Config::Load(g_cfgName);
@@ -950,7 +973,7 @@ static void ApplyStyle() {
     s.FrameBorderSize = 1.f;
     s.WindowBorderSize = 1.f;
     s.PopupBorderSize = 1.f;
-    s.ItemSpacing = ImVec2(8, 9);
+    s.ItemSpacing = ImVec2(8, 6);
     s.ItemInnerSpacing = ImVec2(6, 6);
     s.FramePadding = ImVec2(10, 6);
 
@@ -1121,7 +1144,7 @@ void Menu::Render()
 
         // Body
         ImGui::PushStyleColor(ImGuiCol_ChildBg, Col::Content);
-        ImGui::BeginChild("##body", ImVec2(0, 0), false);
+        ImGui::BeginChild("##body", ImVec2(0, 0), false, ImGuiWindowFlags_NoScrollbar);
         {
             ImGui::Dummy(ImVec2(0, 4));
             ImGui::Indent(16);
@@ -1134,7 +1157,7 @@ void Menu::Render()
 
             // keep right padding too
             ImGui::PushItemWidth(ImGui::GetWindowWidth() - 32);
-            ImGui::BeginChild("##bodyinner", ImVec2(ImGui::GetWindowWidth() - 32, ImGui::GetContentRegionAvail().y - 8), false);
+            ImGui::BeginChild("##bodyinner", ImVec2(ImGui::GetWindowWidth() - 32, ImGui::GetContentRegionAvail().y - 8), false, ImGuiWindowFlags_NoScrollbar);
             switch (activeTab) {
             case 0: RenderRageTab();    break;
             case 1: RenderLegitTab();   break;

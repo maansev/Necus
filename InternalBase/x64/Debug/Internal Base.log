@@ -1,0 +1,8 @@
+﻿  Проверка источников на наличие зависимостей модуля…
+  Hooks.cpp
+C:\Users\anton\OneDrive\Desktop\CS2 Internal\Internal Base\src\sdk\entity\Classes.h(54): warning C4114: Множественное использование одного и того же квалификатора типа.
+C:\Users\anton\OneDrive\Desktop\CS2 Internal\Internal Base\src\feature\misc\Misc.h(3,16): warning C4099: CUserCmd: имя типа, ранее отображенное с помощью "class", теперь отображено с помощью "struct"
+C:\Users\anton\OneDrive\Desktop\CS2 Internal\Internal Base\src\sdk\entity\Classes.h(17,7): message : см. объявление "CUserCmd"
+  Main.cpp
+  Создание кода...
+  Internal Base.vcxproj -> C:\Users\anton\OneDrive\Desktop\CS2 Internal\x64\Debug\Internal Base.dll

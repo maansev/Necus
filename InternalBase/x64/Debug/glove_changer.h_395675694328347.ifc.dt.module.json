@@ -1,0 +1,22 @@
+{
+    "version": 1,
+    "revision": 0,
+    "rules": [
+        {
+            "primary-output": "x64\\Debug\\glove_changer.obj",
+            "outputs": [
+                "x64\\Debug\\glove_changer.h_395675694328347.ifc.dt.module.json",
+                "x64\\Debug\\glove_changer.h_395675694328347.ifc.dt.d.json",
+                "x64\\Debug\\glove_changer.h.ifc"
+            ],
+            "provides": [
+                {
+                    "logical-name": "C:\\Users\\anton\\OneDrive\\Desktop\\CS2 Internal\\Internal Base\\src\\feature\\misc\\glove_changer.h",
+                    "source-path": "c:\\users\\anton\\onedrive\\desktop\\cs2 internal\\internal base\\src\\feature\\misc\\glove_changer.h",
+                    "lookup-method": "absolute"
+                }
+            ],
+            "requires": []
+        }
+    ]
+}

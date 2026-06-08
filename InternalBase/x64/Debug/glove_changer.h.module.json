@@ -1,0 +1,22 @@
+{
+    "version": 1,
+    "revision": 0,
+    "rules": [
+        {
+            "primary-output": "x64\\Debug\\glove_changer.h.obj",
+            "outputs": [
+                "C:\\Users\\anton\\OneDrive\\Desktop\\CS2 Internal\\Internal Base\\x64\\Debug\\vc143.pdb",
+                "x64\\Debug\\",
+                "C:\\Users\\anton\\OneDrive\\Desktop\\CS2 Internal\\Internal Base\\x64\\Debug\\glove_changer.h.ifc"
+            ],
+            "provides": [
+                {
+                    "logical-name": "src\\feature\\misc\\glove_changer.h",
+                    "source-path": "c:\\users\\anton\\onedrive\\desktop\\cs2 internal\\internal base\\src\\feature\\misc\\glove_changer.h",
+                    "lookup-method": "absolute"
+                }
+            ],
+            "requires": []
+        }
+    ]
+}

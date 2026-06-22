@@ -1,0 +1,820 @@
+#define NOMINMAX
+#include "Visuals.h"
+#include "esp/Esp.h"
+#include "enemycounter/EnemyCounter.h"
+#include "chams/Chams.h"
+#include "../../../ext/imgui/imgui.h"
+#include "../../sdk/utils/Globals.h"
+#include "../../sdk/utils/Utils.h"
+#include "../../sdk/utils/Vector.h"
+#include "../../sdk/entity/EntityManager.h"
+#include "../../sdk/memory/Offsets.h"
+#include "../../sdk/memory/PatternScan.h"
+#include "../../sdk/utils/Log.h"
+#include <cmath>
+#include <vector>
+#include <unordered_map>
+#include <algorithm>
+#include <Windows.h>
+
+// ─── SEH-safe helpers (plain functions, no C++ objects — avoids C2712) ───────
+static bool SafeReadBool(uintptr_t addr, bool& out) {
+    if (!addr) return false;
+    __try { out = *reinterpret_cast<bool*>(addr); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+static bool SafeReadPtr(uintptr_t addr, uintptr_t& out) {
+    if (!addr) return false;
+    __try { out = *reinterpret_cast<uintptr_t*>(addr); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+static bool SafeReadI32(uintptr_t addr, int32_t& out) {
+    if (!addr) return false;
+    __try { out = *reinterpret_cast<int32_t*>(addr); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+static bool SafeReadF32(uintptr_t addr, float& out) {
+    if (!addr) return false;
+    __try { out = *reinterpret_cast<float*>(addr); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+static bool SafeReadVec(uintptr_t addr, Vector& out) {
+    if (!addr) return false;
+    __try { out = *reinterpret_cast<Vector*>(addr); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+static bool SafeWriteU8(uintptr_t addr, uint8_t v) {
+    if (!addr) return false;
+    __try { *reinterpret_cast<uint8_t*>(addr) = v; return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+static bool SafeWriteF32(uintptr_t addr, float v) {
+    if (!addr) return false;
+    __try { *reinterpret_cast<float*>(addr) = v; return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+static bool SafeReadU32(uintptr_t addr, uint32_t& out) {
+    if (!addr) return false;
+    __try { out = *reinterpret_cast<uint32_t*>(addr); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// Local pawn address straight from client.dll (not the cached EntityManager copy)
+static uintptr_t GetLocalPawnAddr() {
+    uintptr_t client = Memory::GetModuleBase("client.dll");
+    if (!client) return 0;
+    uintptr_t pawn = 0;
+    if (!SafeReadPtr(client + Offsets::dwLocalPlayerPawn, pawn)) return 0;
+    return pawn;
+}
+
+// Eye position + forward direction of the local player
+static bool GetLocalEyeAndDir(Vector& eye, Vector& dir) {
+    uintptr_t client = Memory::GetModuleBase("client.dll");
+    uintptr_t pawn = GetLocalPawnAddr();
+    if (!client || !pawn) return false;
+
+    Vector origin{}, viewOff{};
+    if (!SafeReadVec(pawn + Offsets::m_vOldOrigin, origin)) return false;
+    if (!SafeReadVec(pawn + Offsets::m_vecViewOffset, viewOff)) return false;
+    eye = { origin.x + viewOff.x, origin.y + viewOff.y, origin.z + viewOff.z };
+
+    float pitch = 0.f, yaw = 0.f;
+    if (!SafeReadF32(client + Offsets::dwViewAngles + 0, pitch)) return false;
+    if (!SafeReadF32(client + Offsets::dwViewAngles + 4, yaw))   return false;
+
+    const float D2R = 3.14159265f / 180.f;
+    float cp = cosf(pitch * D2R), sp = sinf(pitch * D2R);
+    float cy = cosf(yaw * D2R),   sy = sinf(yaw * D2R);
+    dir = { cp * cy, cp * sy, -sp };
+    return true;
+}
+
+// ─── Removals ────────────────────────────────────────────────────────────────
+namespace Removals {
+
+    static bool s_legsHidden = false;
+
+    // ── Scope overlay removal ─────────────────────────────────────────────────
+    // CS2 draws the black scope vignette only while m_bIsScoped is true at
+    // render time. Zero it right before the frame renders (FRAME_RENDER_START)
+    // and restore right after (stage 7) — zoom (FOV) is server-driven and
+    // unaffected, but the overlay/blur never draws.
+    static bool s_scopedWasTrue = false;
+
+    void OnRenderStart() {
+        s_scopedWasTrue = false;
+        if (!Globals::misc_remove_scope_overlay) return;
+        uintptr_t pawn = GetLocalPawnAddr();
+        if (!pawn) return;
+        bool scoped = false;
+        if (SafeReadBool(pawn + Offsets::m_bIsScoped, scoped) && scoped) {
+            SafeWriteU8(pawn + Offsets::m_bIsScoped, 0);
+            s_scopedWasTrue = true;
+        }
+    }
+
+    void OnRenderEnd() {
+        if (!s_scopedWasTrue) return;
+        uintptr_t pawn = GetLocalPawnAddr();
+        if (pawn) SafeWriteU8(pawn + Offsets::m_bIsScoped, 1);
+        s_scopedWasTrue = false;
+    }
+
+    // ── Crosshair removal: hide the built-in CS2 crosshair via HideHUD bits ──
+    static bool s_hudBitSet = false;
+
+    static void UpdateCrosshair() {
+        uintptr_t pawn = GetLocalPawnAddr();
+        if (!pawn) return;
+
+        int32_t hud = 0;
+        if (!SafeReadI32(pawn + Offsets::m_iHideHUD, hud)) return;
+        constexpr int32_t HIDEHUD_CROSSHAIR = 1 << 8;  // 256
+
+        if (Globals::misc_remove_crosshair) {
+            if (!(hud & HIDEHUD_CROSSHAIR)) {
+                __try { *reinterpret_cast<int32_t*>(pawn + Offsets::m_iHideHUD) = hud | HIDEHUD_CROSSHAIR; }
+                __except (EXCEPTION_EXECUTE_HANDLER) {}
+            }
+            s_hudBitSet = true;
+        } else if (s_hudBitSet) {
+            __try { *reinterpret_cast<int32_t*>(pawn + Offsets::m_iHideHUD) = hud & ~HIDEHUD_CROSSHAIR; }
+            __except (EXCEPTION_EXECUTE_HANDLER) {}
+            s_hudBitSet = false;
+        }
+    }
+
+    // ── Team intro skip ("Первая половина" заставка) ─────────────────────────
+    // CCSGameRules::m_bTeamIntroPeriod = false завершает интро мгновенно.
+    // Активно только когда оба оффсета (dwGameRules / m_bTeamIntroPeriod)
+    // заполнены из дампа.
+    static void UpdateTeamIntro() {
+        if (!Globals::misc_remove_team_intro) return;
+        if (!Offsets::dwGameRules || !Offsets::m_bTeamIntroPeriod) return;
+        uintptr_t client = Memory::GetModuleBase("client.dll");
+        if (!client) return;
+        uintptr_t rules = 0;
+        if (!SafeReadPtr(client + Offsets::dwGameRules, rules) || !rules) return;
+        bool intro = false;
+        if (SafeReadBool(rules + Offsets::m_bTeamIntroPeriod, intro) && intro)
+            SafeWriteU8(rules + Offsets::m_bTeamIntroPeriod, 0);
+    }
+
+    // Per-frame memory writes (legs / shadows) — independent of scope state
+    static void UpdateWorld() {
+        UpdateCrosshair();
+        UpdateTeamIntro();
+
+        // Legs: zero the alpha of the local player's world model so you don't
+        // see your own legs/body when looking down. Restore on disable.
+        //
+        // KNOWN LIMITATION: in CS2 the first-person legs are drawn by the world
+        // model pass controlled by the convar `cl_first_person_uses_world_model`
+        // (and the render alpha is recomputed by the engine), so a raw
+        // m_clrRender alpha write is frequently overwritten / ignored for the
+        // local pawn. Without an ICvar interface (removed — it froze the game)
+        // there is no reliable convar path; the alpha write below is best-effort
+        // and is re-applied every Present frame via Visuals::UpdateRemovals().
+        uintptr_t pawn = GetLocalPawnAddr();
+
+        // Scope overlay: also zero every frame as belt-and-suspenders
+        if (Globals::misc_remove_scope_overlay && pawn) {
+            bool sc = false;
+            if (SafeReadBool(pawn + Offsets::m_bIsScoped, sc) && sc)
+                SafeWriteU8(pawn + Offsets::m_bIsScoped, 0);
+        }
+        if (pawn) {
+            if (Globals::misc_remove_legs) {
+                // NOTE: the GameSceneNode m_flScale write was REMOVED. Offset 0x40
+                // is NOT m_flScale on the current build — it lands on a pointer
+                // field inside CGameSceneNode (scene-graph parent/child/owner), so
+                // writing 0.0001f there corrupted a node pointer and the engine
+                // crashed traversing the scene graph at render time
+                // (client.dll+0x96494B, deterministic AV read of 0x38D1B81F ≈ the
+                // 0.0001f we wrote). Until m_flScale is re-confirmed from a fresh
+                // dump we rely ONLY on the render-alpha path, which is harmless
+                // even if the offset is stale.
+                SafeWriteU8(pawn + Offsets::m_clrRender + 3, 0);
+                s_legsHidden = true;
+            } else if (s_legsHidden) {
+                SafeWriteU8(pawn + Offsets::m_clrRender + 3, 255);
+                s_legsHidden = false;
+            }
+        }
+
+        // Shadows: kill shadow strength on all player pawns; restore on disable.
+        static bool s_shadowsKilled = false;
+        if (Globals::misc_remove_shadows) {
+            const auto& ents = EntityManager::Get().GetEntities();
+            for (const auto& ent : ents)
+                SafeWriteF32(reinterpret_cast<uintptr_t>(ent.pawn) + Offsets::m_flShadowStrength, 0.f);
+            if (pawn)
+                SafeWriteF32(pawn + Offsets::m_flShadowStrength, 0.f);
+            s_shadowsKilled = true;
+        } else if (s_shadowsKilled) {
+            const auto& ents = EntityManager::Get().GetEntities();
+            for (const auto& ent : ents)
+                SafeWriteF32(reinterpret_cast<uintptr_t>(ent.pawn) + Offsets::m_flShadowStrength, 1.f);
+            if (pawn)
+                SafeWriteF32(pawn + Offsets::m_flShadowStrength, 1.f);
+            s_shadowsKilled = false;
+        }
+    }
+
+} // namespace Removals
+
+// Exported for Hooks.cpp (FrameStageNotify stage 5 / stage 7).
+// All removals are memory writes timed to the render frame: crosshair via
+// HideHUD, scope overlay via m_bIsScoped toggle, legs/shadows via UpdateWorld.
+namespace ThirdPerson { static void Update(); }   // defined later in this TU
+
+void Visuals::OnRenderStart() {
+    Removals::UpdateWorld();
+    Removals::OnRenderStart();
+    // Third person write lives here (FSN stage 5 / sim thread) so it runs AFTER
+    // the engine's per-frame camera reset — writing it from the Present thread
+    // lost the race and only flickered. This makes it hold every frame.
+    __try { ThirdPerson::Update(); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+void Visuals::OnRenderEnd() {
+    Removals::OnRenderEnd();
+}
+void Visuals::UpdateRemovals() {
+    Removals::UpdateWorld();
+}
+
+// ─── Bullet Tracer: animated tracer + hit cross on the target ────────────────
+namespace BulletTracer {
+
+    static constexpr float kBulletSpeed = 8000.f; // units/sec visual travel speed
+    static constexpr int   kSegments    = 16;
+
+    struct Tracer { Vector start, end; double t; float totalDist; };
+    struct Hit    { Vector pos;        double t; };
+
+    static std::vector<Tracer>          s_tracers;
+    static std::vector<Hit>             s_hits;
+    static std::unordered_map<int,int>  s_prevHealth;
+    static std::unordered_map<int,int>  s_prevEntShots;   // per-entity m_iShotsFired
+    static int                          s_prevShots = 0;
+    static double                       s_lastShotTime = -10.0;
+
+    // Eye position + view direction of an arbitrary pawn (for other players' tracers)
+    static bool GetPawnEyeAndDir(uintptr_t pa, Vector& eye, Vector& dir) {
+        Vector origin{}, viewOff{};
+        if (!SafeReadVec(pa + Offsets::m_vOldOrigin, origin)) return false;
+        if (!SafeReadVec(pa + Offsets::m_vecViewOffset, viewOff)) return false;
+        eye = { origin.x + viewOff.x, origin.y + viewOff.y, origin.z + viewOff.z };
+
+        float pitch = 0.f, yaw = 0.f;
+        if (!SafeReadF32(pa + Offsets::m_angEyeAngles + 0, pitch)) return false;
+        if (!SafeReadF32(pa + Offsets::m_angEyeAngles + 4, yaw))   return false;
+
+        const float D2R = 3.14159265f / 180.f;
+        float cp = cosf(pitch * D2R), sp = sinf(pitch * D2R);
+        float cy = cosf(yaw * D2R),   sy = sinf(yaw * D2R);
+        dir = { cp * cy, cp * sy, -sp };
+        return true;
+    }
+
+    static void AddTracer(const Vector& eye, const Vector& dir, double now) {
+        Tracer tr;
+        tr.start = { eye.x + dir.x * 60.f,   eye.y + dir.y * 60.f,   eye.z + dir.z * 60.f - 4.f };
+        tr.end   = { eye.x + dir.x * 8000.f, eye.y + dir.y * 8000.f, eye.z + dir.z * 8000.f };
+        tr.t = now;
+        float dx = tr.end.x - tr.start.x, dy = tr.end.y - tr.start.y, dz = tr.end.z - tr.start.z;
+        tr.totalDist = sqrtf(dx*dx + dy*dy + dz*dz);
+        s_tracers.push_back(tr);
+    }
+
+    static void Update() {
+        double now = ImGui::GetTime();
+
+        // 1) Own shots: m_iShotsFired increases while firing → tracer + arm hit window
+        uintptr_t pawn = GetLocalPawnAddr();
+        if (pawn) {
+            int shots = 0;
+            if (SafeReadI32(pawn + Offsets::m_iShotsFired, shots)) {
+                if (shots > s_prevShots) {
+                    s_lastShotTime = now;
+                    Vector eye{}, dir{};
+                    if (GetLocalEyeAndDir(eye, dir))
+                        AddTracer(eye, dir, now);
+                }
+                s_prevShots = shots;
+            }
+        }
+
+        // 2) Other players' shots → tracers, filtered by Teammates/Enemies toggles
+        const auto& ents = EntityManager::Get().GetEntities();
+        {
+            std::unordered_map<int,int> freshShots;
+            freshShots.reserve(ents.size());
+            for (const auto& ent : ents) {
+                uintptr_t pa = reinterpret_cast<uintptr_t>(ent.pawn);
+                int shots = 0;
+                if (!SafeReadI32(pa + Offsets::m_iShotsFired, shots)) continue;
+
+                auto it = s_prevEntShots.find(ent.index);
+                if (it != s_prevEntShots.end() && shots > it->second) {
+                    bool want = ent.isEnemy ? Globals::misc_hit_marker_tracer_enemy
+                                            : Globals::misc_hit_marker_tracer_team;
+                    if (want) {
+                        Vector eye{}, dir{};
+                        if (GetPawnEyeAndDir(pa, eye, dir))
+                            AddTracer(eye, dir, now);
+                    }
+                }
+                freshShots[ent.index] = shots;
+            }
+            s_prevEntShots = std::move(freshShots);
+        }
+
+        // 3) Own hits: HP dropped within 350ms of our shot → "+" cross at the target
+        std::unordered_map<int,int> fresh;
+        fresh.reserve(ents.size());
+        for (const auto& ent : ents) {
+            uintptr_t pa = reinterpret_cast<uintptr_t>(ent.pawn);
+            int hp = 0;
+            if (!SafeReadI32(pa + Offsets::m_iHealth, hp)) continue;
+
+            auto it = s_prevHealth.find(ent.index);
+            if (it != s_prevHealth.end() && it->second > 0 && hp < it->second
+                && (now - s_lastShotTime) < 0.35) {
+                Vector origin{}, viewOff{};
+                if (SafeReadVec(pa + Offsets::m_vOldOrigin, origin)) {
+                    SafeReadVec(pa + Offsets::m_vecViewOffset, viewOff);
+                    s_hits.push_back({ { origin.x, origin.y, origin.z + viewOff.z * 0.8f }, now });
+                }
+            }
+            fresh[ent.index] = hp;
+        }
+        s_prevHealth = std::move(fresh);
+    }
+
+    static void Render() {
+        if (!Globals::misc_hit_marker) return;
+
+        Update();
+
+        double now = ImGui::GetTime();
+        float  dur = Globals::misc_hit_marker_duration;
+        const float* c = Globals::misc_hit_marker_color;
+        const float sw = ImGui::GetIO().DisplaySize.x;
+        const float sh = ImGui::GetIO().DisplaySize.y;
+
+        float maxAge = dur + 2.f;
+        s_tracers.erase(std::remove_if(s_tracers.begin(), s_tracers.end(),
+            [&](const Tracer& t) { return (now - t.t) > maxAge; }), s_tracers.end());
+        s_hits.erase(std::remove_if(s_hits.begin(), s_hits.end(),
+            [&](const Hit& h) { return (now - h.t) >= dur; }), s_hits.end());
+
+        ImDrawList* dl = ImGui::GetForegroundDrawList();
+
+        // ── Bullet tracers ───────────────────────────────────────────────────
+        for (const auto& tr : s_tracers) {
+            float age = (float)(now - tr.t);
+
+            if (Globals::misc_hit_marker_style == 0) {
+                // ── Classic: простая линия с линейным фейдом ──────────────
+                float alpha = 1.f - age / dur;
+                if (alpha <= 0.f) continue;
+                Vector s1{}, s2{};
+                if (Utils::WorldToScreen(tr.start, s1, (float*)Globals::ViewMatrix, sw, sh) &&
+                    Utils::WorldToScreen(tr.end,   s2, (float*)Globals::ViewMatrix, sw, sh)) {
+                    ImU32 col = ImGui::ColorConvertFloat4ToU32(ImVec4(c[0], c[1], c[2], c[3] * alpha));
+                    dl->AddLine({ s1.x, s1.y }, { s2.x, s2.y }, col, 1.6f);
+                }
+            } else if (Globals::misc_hit_marker_style == 2) {
+                // ── Bloom: мгновенная линия с многослойным свечением ──────
+                float alpha = 1.f - age / dur;
+                if (alpha <= 0.f) continue;
+                Vector s1{}, s2{};
+                if (!Utils::WorldToScreen(tr.start, s1, (float*)Globals::ViewMatrix, sw, sh) ||
+                    !Utils::WorldToScreen(tr.end,   s2, (float*)Globals::ViewMatrix, sw, sh)) continue;
+
+                float w = Globals::misc_hit_marker_size * 0.3f + 0.5f;
+                int   r = (int)(c[0]*255), g2 = (int)(c[1]*255), b = (int)(c[2]*255);
+
+                // outer glow layers (wide, low alpha) → core (thin, full alpha)
+                dl->AddLine({s1.x,s1.y},{s2.x,s2.y}, IM_COL32(r,g2,b,(int)(alpha*c[3]*20.f)),  w*8.f);
+                dl->AddLine({s1.x,s1.y},{s2.x,s2.y}, IM_COL32(r,g2,b,(int)(alpha*c[3]*45.f)),  w*5.f);
+                dl->AddLine({s1.x,s1.y},{s2.x,s2.y}, IM_COL32(r,g2,b,(int)(alpha*c[3]*90.f)),  w*3.f);
+                dl->AddLine({s1.x,s1.y},{s2.x,s2.y}, IM_COL32(r,g2,b,(int)(alpha*c[3]*180.f)), w*1.5f);
+                dl->AddLine({s1.x,s1.y},{s2.x,s2.y}, IM_COL32(255,255,255,(int)(alpha*200.f)),  w*0.6f);
+            } else {
+                // ── Animated: летящая пуля с градиентом и impact ring ─────
+                float travelTime = tr.totalDist / kBulletSpeed;
+                if (travelTime < 0.001f) travelTime = 0.001f;
+                float bulletFrac = age / travelTime;
+                if (bulletFrac > 1.f) bulletFrac = 1.f;
+
+                float trailAge   = age - travelTime;
+                float trailAlpha = 1.f;
+                if (trailAge > 0.f) {
+                    trailAlpha = 1.f - trailAge / dur;
+                    if (trailAlpha <= 0.f) continue;
+                    trailAlpha *= trailAlpha;
+                }
+
+                ImVec2 pts[kSegments + 1];
+                bool   vis[kSegments + 1] = {};
+                for (int s = 0; s <= kSegments; s++) {
+                    float frac = (float)s / kSegments * bulletFrac;
+                    Vector p3d = {
+                        tr.start.x + (tr.end.x - tr.start.x) * frac,
+                        tr.start.y + (tr.end.y - tr.start.y) * frac,
+                        tr.start.z + (tr.end.z - tr.start.z) * frac
+                    };
+                    Vector sc{};
+                    if (Utils::WorldToScreen(p3d, sc, (float*)Globals::ViewMatrix, sw, sh)) {
+                        pts[s] = { sc.x, sc.y };
+                        vis[s] = true;
+                    }
+                }
+
+                for (int s = 0; s < kSegments; s++) {
+                    if (!vis[s] || !vis[s+1]) continue;
+                    float brightness = 0.2f + 0.8f * ((float)s / kSegments);
+                    int   a = (int)(trailAlpha * brightness * c[3] * 220.f);
+                    if (a <= 0) continue;
+                    if (a > 255) a = 255;
+                    ImU32 col = IM_COL32((int)(c[0]*255), (int)(c[1]*255), (int)(c[2]*255), a);
+                    dl->AddLine(pts[s], pts[s+1], col, Globals::misc_hit_marker_size * 0.25f + 1.f);
+                    int ga = (int)(trailAlpha * brightness * 40.f);
+                    if (ga > 0)
+                        dl->AddLine(pts[s], pts[s+1], IM_COL32(180,200,255,ga),
+                                    Globals::misc_hit_marker_size * 0.8f + 2.f);
+                }
+
+                if (bulletFrac < 1.f && vis[kSegments]) {
+                    int ha = (int)(trailAlpha * c[3] * 255.f);
+                    if (ha > 0) {
+                        dl->AddCircleFilled(pts[kSegments], 4.f, IM_COL32(255,255,255,ha));
+                        dl->AddCircleFilled(pts[kSegments], 2.f, IM_COL32(255,255,200,ha));
+                    }
+                }
+
+                if (bulletFrac >= 1.f && trailAlpha > 0.05f) {
+                    Vector sc{};
+                    if (Utils::WorldToScreen(tr.end, sc, (float*)Globals::ViewMatrix, sw, sh)) {
+                        float sz = 4.f * trailAlpha;
+                        dl->AddCircleFilled({sc.x,sc.y}, sz, IM_COL32(255,200,100,(int)(trailAlpha*200.f)));
+                        dl->AddCircle({sc.x,sc.y}, sz*1.8f, IM_COL32(255,255,255,(int)(trailAlpha*120.f)), 0, 1.5f);
+                    }
+                }
+            }
+        }
+
+        // ── Hit cross marker ─────────────────────────────────────────────────
+        for (const auto& h : s_hits) {
+            float t     = (float)((now - h.t) / dur);
+            float alpha = (1.f - t) * (1.f - t);
+            Vector sc{};
+            if (!Utils::WorldToScreen(h.pos, sc, (float*)Globals::ViewMatrix, sw, sh)) continue;
+
+            float gap = Globals::misc_hit_marker_size * 0.5f;
+            float arm = Globals::misc_hit_marker_size * (1.f + t * 0.3f);
+
+            ImU32 shadow = IM_COL32(0, 0, 0, (int)(180 * alpha));
+            ImU32 col    = ImGui::ColorConvertFloat4ToU32(ImVec4(c[0], c[1], c[2], c[3] * alpha));
+
+            dl->AddLine({ sc.x - gap - arm + 1, sc.y + 1 }, { sc.x - gap + 1, sc.y + 1 }, shadow, 1.6f);
+            dl->AddLine({ sc.x + gap + 1,       sc.y + 1 }, { sc.x + gap + arm + 1, sc.y + 1 }, shadow, 1.6f);
+            dl->AddLine({ sc.x + 1, sc.y - gap - arm + 1 }, { sc.x + 1, sc.y - gap + 1 }, shadow, 1.6f);
+            dl->AddLine({ sc.x + 1, sc.y + gap + 1 }, { sc.x + 1, sc.y + gap + arm + 1 }, shadow, 1.6f);
+
+            dl->AddLine({ sc.x - gap - arm, sc.y }, { sc.x - gap, sc.y }, col, 1.4f);
+            dl->AddLine({ sc.x + gap,       sc.y }, { sc.x + gap + arm, sc.y }, col, 1.4f);
+            dl->AddLine({ sc.x, sc.y - gap - arm }, { sc.x, sc.y - gap }, col, 1.4f);
+            dl->AddLine({ sc.x, sc.y + gap },       { sc.x, sc.y + gap + arm }, col, 1.4f);
+        }
+    }
+
+} // namespace BulletTracer
+
+// ─── Damage log ───────────────────────────────────────────────────────────────
+// Poll-based detection (no game-event listener available): mirrors the hit
+// marker's HP-drop tracking. When an enemy's HP drops within 350ms of our own
+// m_iShotsFired increment, we log "Hit <name> for <dmg> (<hp> hp)". Hitbox is
+// unknown without events, so it is omitted.
+static bool SafeCopyStr(uintptr_t addr, char* out, size_t n) {
+    if (!addr || !out || !n) return false;
+    __try {
+        size_t i = 0;
+        const char* src = reinterpret_cast<const char*>(addr);
+        for (; i < n - 1 && src[i]; ++i) out[i] = src[i];
+        out[i] = '\0';
+        return i > 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { out[0] = '\0'; return false; }
+}
+
+namespace DamageLog {
+
+    static std::vector<Visuals::DmgEntry>  s_log;
+    static std::unordered_map<int, int>    s_prevHealth;
+    static int                             s_prevShots    = 0;
+    static double                          s_lastShotTime = -10.0;
+
+    static void Update() {
+        double now = ImGui::GetTime();
+
+        uintptr_t pawn = GetLocalPawnAddr();
+        if (pawn) {
+            int shots = 0;
+            if (SafeReadI32(pawn + Offsets::m_iShotsFired, shots)) {
+                if (shots > s_prevShots) s_lastShotTime = now;
+                s_prevShots = shots;
+            }
+        }
+
+        const auto& ents = EntityManager::Get().GetEntities();
+        std::unordered_map<int, int> fresh;
+        fresh.reserve(ents.size());
+        for (const auto& ent : ents) {
+            if (!ent.isEnemy) { continue; }
+            uintptr_t pa = reinterpret_cast<uintptr_t>(ent.pawn);
+            int hp = 0;
+            if (!SafeReadI32(pa + Offsets::m_iHealth, hp)) continue;
+
+            auto it = s_prevHealth.find(ent.index);
+            if (it != s_prevHealth.end() && it->second > 0 && hp < it->second
+                && (now - s_lastShotTime) < 0.35) {
+                Visuals::DmgEntry e{};
+                e.dmg  = it->second - hp;
+                e.hp   = hp < 0 ? 0 : hp;
+                e.time = now;
+                if (!SafeCopyStr(reinterpret_cast<uintptr_t>(ent.controller) + Offsets::m_iszPlayerName,
+                                 e.name, sizeof(e.name)))
+                    strncpy_s(e.name, "Enemy", _TRUNCATE);
+                s_log.push_back(e);
+            }
+            fresh[ent.index] = hp;
+        }
+        s_prevHealth = std::move(fresh);
+
+        // drop expired (5s) and keep the container small
+        s_log.erase(std::remove_if(s_log.begin(), s_log.end(),
+            [&](const Visuals::DmgEntry& e) { return now - e.time >= 5.0; }), s_log.end());
+        if (s_log.size() > 16)
+            s_log.erase(s_log.begin(), s_log.end() - 16);
+    }
+
+} // namespace DamageLog
+
+int Visuals::GetDamageLog(Visuals::DmgEntry* out, int maxCount) {
+    int n = 0;
+    for (auto it = DamageLog::s_log.rbegin(); it != DamageLog::s_log.rend() && n < maxCount; ++it)
+        out[n++] = *it;   // newest first
+    return n;
+}
+
+// ─── Penetration crosshair ───────────────────────────────────────────────────
+// Shows whether an enemy is in your line of fire: if the crosshair ray passes
+// through/near an enemy body — "can hit/pen" color, otherwise "no" color.
+namespace PenXhair {
+
+    static void Render() {
+        if (!Globals::misc_penetration_xhair) return;
+
+        Vector eye{}, dir{};
+        if (!GetLocalEyeAndDir(eye, dir)) return;
+
+        bool onTarget = false;
+        const auto& ents = EntityManager::Get().GetEntities();
+        for (const auto& ent : ents) {
+            if (!ent.isEnemy) continue;
+            uintptr_t pa = reinterpret_cast<uintptr_t>(ent.pawn);
+            Vector origin{}, viewOff{};
+            if (!SafeReadVec(pa + Offsets::m_vOldOrigin, origin)) continue;
+            SafeReadVec(pa + Offsets::m_vecViewOffset, viewOff);
+            Vector chest = { origin.x, origin.y, origin.z + viewOff.z * 0.75f };
+
+            // distance from ray (eye, dir) to chest point
+            Vector to = { chest.x - eye.x, chest.y - eye.y, chest.z - eye.z };
+            float along = to.x * dir.x + to.y * dir.y + to.z * dir.z;
+            if (along < 50.f || along > 5000.f) continue;
+            Vector closest = { eye.x + dir.x * along, eye.y + dir.y * along, eye.z + dir.z * along };
+            float dx = chest.x - closest.x, dy = chest.y - closest.y, dz = chest.z - closest.z;
+            float distSq = dx * dx + dy * dy + dz * dz;
+            // ~38 units ≈ half a body width + some legroom (covers chest→head band)
+            if (distSq < 38.f * 38.f) { onTarget = true; break; }
+        }
+
+        const float* c = onTarget ? Globals::misc_pen_yes_color : Globals::misc_pen_no_color;
+        ImU32 col = ImGui::ColorConvertFloat4ToU32(ImVec4(c[0], c[1], c[2], c[3]));
+
+        ImDrawList* dl = ImGui::GetForegroundDrawList();
+        const float cx = ImGui::GetIO().DisplaySize.x * 0.5f;
+        const float cy = ImGui::GetIO().DisplaySize.y * 0.5f;
+
+        // "+" exactly at the original crosshair position (screen centre)
+        const float l = 4.5f;
+        dl->AddLine({ cx - l, cy }, { cx + l, cy }, col, 2.f);
+        dl->AddLine({ cx, cy - l }, { cx, cy + l }, col, 2.f);
+    }
+
+} // namespace PenXhair
+
+// ─── Third Person ────────────────────────────────────────────────────────────
+// CCSGOInput::m_bInThirdPerson = true — встроенный механизм thirdperson CS2,
+// работает для живого игрока, камера управляется движком.
+namespace ThirdPerson {
+    // Адрес ветки сброса камеры (резолвится один раз).
+    static uintptr_t s_resetAddr = 0;
+    static bool      s_resolved  = false;
+    static bool      s_lastState = false;
+
+    static void Update() {
+        uintptr_t client = Memory::GetModuleBase("client.dll");
+        if (!client) return;
+
+        // Один раз найти ветку сброса камеры.
+        if (!s_resolved) {
+            s_resetAddr = Memory::PatternScan("client.dll", Offsets::sig_ThirdPersonReset);
+            // Fallback: shorter pattern (in case first 4 bytes changed)
+            if (!s_resetAddr)
+                s_resetAddr = Memory::PatternScan("client.dll", "44 38 20 75 10 44 88 67 01");
+            s_resolved = true;
+            Log::Write("ThirdPerson: reset patch addr=0x%llX (%s)",
+                       (unsigned long long)s_resetAddr,
+                       s_resetAddr ? "OK" : "NOT FOUND - write-only mode");
+        }
+
+        // Патч jnz→jmp при смене состояния. Ищем байт 0x75 в найденном адресе
+        // (смещение варьируется в зависимости от того, полный или короткий паттерн сработал).
+        if (s_resetAddr && Globals::misc_thirdperson != s_lastState) {
+            uint8_t* p = reinterpret_cast<uint8_t*>(s_resetAddr);
+            int jnzOff = -1;
+            for (int i = 0; i < 12; ++i) {
+                __try { if (p[i] == 0x75) { jnzOff = i; break; } }
+                __except (EXCEPTION_EXECUTE_HANDLER) { break; }
+            }
+            if (jnzOff >= 0) {
+                DWORD old;
+                if (VirtualProtect(p + jnzOff, 1, PAGE_EXECUTE_READWRITE, &old)) {
+                    p[jnzOff] = Globals::misc_thirdperson ? 0xEB : 0x75;
+                    VirtualProtect(p + jnzOff, 1, old, &old);
+                    Log::Write("ThirdPerson: patched jnz@+%d -> %s",
+                               jnzOff, Globals::misc_thirdperson ? "0xEB(jmp)" : "0x75(jnz)");
+                }
+            }
+            s_lastState = Globals::misc_thirdperson;
+        }
+
+        // m_bInThirdPerson is written in the CCSGOInput::CreateMove hook (Hooks.cpp)
+        // using the REAL CCSGOInput object passed as `a1` — that runs on the sim
+        // thread right after the engine's reset, so it actually sticks. We do NOT
+        // poke client+dwCSGOInput here: its pointer/instance semantics are uncertain
+        // and a wrong deref faults every FSN stage (even with thirdperson OFF),
+        // which the VEH then logs and tanks FPS. The branch patch above is the only
+        // extra path, and only when it actually resolves.
+
+        // Thirdperson camera distance: CS2's built-in thirdperson reuses the observer
+        // chase camera, whose distance lives in CCSPlayerBase_CameraServices. Write
+        // the slider value there each tick so the Distance setting actually applies.
+        if (Globals::misc_thirdperson) {
+            __try {
+                uintptr_t pawnAddr = *reinterpret_cast<uintptr_t*>(client + Offsets::dwLocalPlayerPawn);
+                if (pawnAddr > 0x10000 && pawnAddr < 0x7FFFFFFFFFFFull) {
+                    int32_t hp = *reinterpret_cast<int32_t*>(pawnAddr + Offsets::m_iHealth);
+                    if (hp > 0) {
+                        uintptr_t cam = *reinterpret_cast<uintptr_t*>(pawnAddr + Offsets::m_pCameraServices);
+                        if (cam > 0x10000 && cam < 0x7FFFFFFFFFFFull)
+                            *reinterpret_cast<float*>(cam + Offsets::m_flObserverChaseDistance)
+                                = Globals::misc_thirdperson_dist;
+                    }
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+    }
+} // namespace ThirdPerson
+
+// Public wrapper — called from every FSN stage and Present so we always write
+// AFTER whichever stage the engine uses to reset m_bInThirdPerson.
+void Visuals::WriteThirdPerson() {
+    __try { ThirdPerson::Update(); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+// ─── Visuals::Render ─────────────────────────────────────────────────────────
+void Visuals::Render()
+{
+    // Dual-write third person: also on the Present thread (latest point in the
+    // frame, before D3D present) in addition to FSN stage 5. The engine resets
+    // m_bInThirdPerson on the sim thread, so writing as late as possible gives
+    // the best chance of it sticking. A permanent fix needs the camera-reset
+    // branch patch (pattern currently dead — see ThirdPerson::Update log).
+    __try { ThirdPerson::Update(); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    if (Globals::misc_damage_logs) DamageLog::Update();
+    ESP::Render();
+    ESP::RenderPlayerInfo();   // Show Money — независимо от esp_enabled
+    EnemyCounter::Render();
+    BulletTracer::Render();
+    PenXhair::Render();
+
+    // Spread circle: model-based inaccuracy estimate (no m_flInaccuracy offset
+    // available — heuristic from movement state + recoil). Reads are SEH-safe.
+    if (Globals::misc_spread_circle) {
+        ImDrawList* dl = ImGui::GetBackgroundDrawList();
+        const float sw = ImGui::GetIO().DisplaySize.x;
+        const float sh = ImGui::GetIO().DisplaySize.y;
+        float cx = sw * 0.5f, cy = sh * 0.5f;
+
+        // Base inaccuracy from weapon VData (CFiringModeFloat[2]: [0]=normal mode)
+        // Fallback constants match an AK-47 roughly (used if weapon read fails).
+        float baseStand  = 0.008f, baseCrouch = 0.006f, baseJump = 0.07f,
+              baseMove   = 0.045f, baseFire   = 0.006f, baseSpread = 0.0f;
+
+        uintptr_t pawn = GetLocalPawnAddr();
+        if (pawn) {
+            __try {
+                uintptr_t ws = 0;
+                if (SafeReadPtr(pawn + Offsets::m_pWeaponServices, ws) && ws) {
+                    uint32_t wh = 0;
+                    if (SafeReadU32(ws + Offsets::m_hActiveWeapon, wh) && wh && wh != 0xFFFFFFFFu) {
+                        uintptr_t client = Memory::GetModuleBase("client.dll");
+                        uintptr_t listPtr = *reinterpret_cast<uintptr_t*>(client + Offsets::dwEntityList);
+                        uintptr_t entry  = *reinterpret_cast<uintptr_t*>(listPtr + 8 * ((wh & 0x7FFF) >> 9) + 16);
+                        uintptr_t weap   = *reinterpret_cast<uintptr_t*>(entry + 112 * (wh & 0x1FF));
+                        if (weap) {
+                            // VData pointer is usually at weapon+0x370 (C_CSWeaponBase::m_pVData)
+                            // but if that's wrong the SEH will catch it.
+                            uintptr_t vd = *reinterpret_cast<uintptr_t*>(weap + 0x370);
+                            if (vd) {
+                                // CFiringModeFloat: struct{ float v[2] }, [0]=normal
+                                SafeReadF32(vd + Offsets::m_flInaccuracyStand  + 0, baseStand);
+                                SafeReadF32(vd + Offsets::m_flInaccuracyCrouch + 0, baseCrouch);
+                                SafeReadF32(vd + Offsets::m_flInaccuracyJump   + 0, baseJump);
+                                SafeReadF32(vd + Offsets::m_flInaccuracyMove   + 0, baseMove);
+                                SafeReadF32(vd + Offsets::m_flInaccuracyFire   + 0, baseFire);
+                                SafeReadF32(vd + Offsets::m_flSpread           + 0, baseSpread);
+                            }
+                        }
+                    }
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+
+        float inacc = baseStand;
+        if (pawn) {
+            Vector vel{}; int flags = 0, shots = 0; bool ducked = false;
+            SafeReadVec(pawn + Offsets::m_vecVelocity, vel);
+            SafeReadI32(pawn + Offsets::m_fFlags, flags);
+            SafeReadI32(pawn + Offsets::m_iShotsFired, shots);
+            SafeReadBool(pawn + Offsets::m_bDucked, ducked);
+
+            bool onGround = (flags & 1) != 0;
+            float speed2d = sqrtf(vel.x * vel.x + vel.y * vel.y);
+
+            if (!onGround) {
+                inacc = baseJump;
+            } else if (ducked) {
+                inacc = baseCrouch;
+                float moveT = std::clamp(speed2d / 200.f, 0.f, 1.f);
+                inacc += (baseMove - inacc) * moveT;
+            } else {
+                inacc = baseStand;
+                float moveT = std::clamp(speed2d / 250.f, 0.f, 1.f);
+                inacc += (baseMove - inacc) * moveT;
+            }
+            // Fire penalty scales with recoil (m_iShotsFired decays to 0 in-game)
+            // Cap shots to avoid float overflow (m_iShotsFired can be garbage on bad read)
+            if (shots < 0) shots = 0; else if (shots > 100) shots = 100;
+            if (shots > 0) inacc += shots * baseFire;
+        }
+        // Add spread as a floor
+        inacc = std::max(inacc, baseSpread);
+        // Guard against NaN/Inf from bad VData reads
+        if (!std::isfinite(inacc) || inacc < 0.f) inacc = baseStand;
+
+        // radius_px = tan(inacc) / tan(fov/2) * (screenH/2), fov = 90 deg
+        const float fovH = 90.f * 3.14159265f / 180.f;
+        float radius = tanf(inacc) / tanf(fovH * 0.5f) * (sh * 0.5f);
+        if (!std::isfinite(radius)) radius = 4.f;
+        radius = std::clamp(radius, 3.f, sh * 0.45f);
+
+        // Exponential smoothing across frames to avoid jitter
+        static float s_smoothR = 4.f;
+        float dt = ImGui::GetIO().DeltaTime;
+        float k = 1.f - expf(-dt * 12.f);
+        s_smoothR += (radius - s_smoothR) * k;
+        if (!std::isfinite(s_smoothR)) s_smoothR = 4.f;
+        float r = s_smoothR;
+
+        // Ring: dark halo for contrast + white ring
+        dl->AddCircle(ImVec2(cx, cy), r, IM_COL32(0, 0, 0, 70), 64, 2.6f);
+        dl->AddCircle(ImVec2(cx, cy), r, IM_COL32(255, 255, 255, 190), 64, 1.0f);
+    }
+
+    if (Globals::aimbot_draw_fov) {
+        ImDrawList* dl = ImGui::GetBackgroundDrawList();
+        const float sw = ImGui::GetIO().DisplaySize.x;
+        const float sh = ImGui::GetIO().DisplaySize.y;
+        float radius = tanf(Globals::aimbot_fov * 3.14159265f / 180.f) / 0.75f * (sh * 0.5f);
+        ImU32 col = ImGui::ColorConvertFloat4ToU32(ImVec4(
+            Globals::aimbot_fov_color[0], Globals::aimbot_fov_color[1],
+            Globals::aimbot_fov_color[2], Globals::aimbot_fov_color[3]));
+        dl->AddCircle(ImVec2(sw * 0.5f, sh * 0.5f), radius, col, 64, 1.5f);
+    }
+}
